@@ -1,0 +1,98 @@
+-- Databricks notebook source
+CREATE OR REFRESH STREAMING TABLE orders_bronze
+AS
+SELECT *,
+       _metadata.file_name AS filename,
+       _metadata.file_modification_time AS file_time,
+       current_timestamp() AS load_time
+FROM cloud_files(
+  '/Volumes/deltalake_catalog/landing/orders',
+  'csv',
+  map(
+    "cloudFiles.inferColumnTypes","true",
+    "cloudFiles.schemaEvolutionMode","addNewColumns",
+    "cloudFiles.rescuedDataColumn","_rescued_data"
+  )
+);
+
+-- COMMAND ----------
+
+CREATE OR REFRESH STREAMING TABLE customers_bronze
+AS
+SELECT *,
+       _metadata.file_name AS filename,
+       _metadata.file_modification_time AS file_time,
+       current_timestamp() AS load_time
+FROM cloud_files(
+  '/Volumes/deltalake_catalog/landing/customers',
+  'csv',
+  map(
+    "cloudFiles.inferColumnTypes","true",
+    "cloudFiles.schemaEvolutionMode","addNewColumns",
+    "cloudFiles.rescuedDataColumn","_rescued_data"
+  )
+);
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC Step 2: Take the data from bronze, clean it and load it to silver cleaned
+-- MAGIC
+
+-- COMMAND ----------
+
+CREATE STREAMING TABLE orders_silver_cleaned (
+	CONSTRAINT valid_order EXPECT (order_id is NOT NULL) ON VIOLATION DROP ROW,
+	CONSTRAINT valid_customer EXPECT (customer_id is NOT NULL) ON VIOLATION DROP ROW	
+) as 
+SELECT orderid as order_id,
+orderdate as order_date,
+customerid as customer_id,
+totalamount as total_amount,
+status,
+filename as file_name,
+load_time
+FROM STREAM(orders_bronze);
+
+
+CREATE STREAMING TABLE customers_silver_cleaned(
+	CONSTRAINT valid_customer EXPECT (customer_id is NOT NULL) ON VIOLATION DROP ROW
+) as
+SELECT customerid as customer_id,
+customername as customer_name,
+address as city,
+dateofbirth as dob,
+registrationdate as customer_since,
+filename as file_name,
+load_time
+from STREAM(customers_bronze);
+
+-- COMMAND ----------
+
+CREATE STREAMING TABLE customers_silver;
+
+APPLY CHANGES into customers_silver
+from STREAM(customers_silver_cleaned)
+keys(customer_id)
+sequence by load_time
+stored as scd type 2;
+
+-- COMMAND ----------
+
+CREATE STREAMING TABLE orders_silver;
+
+CREATE FLOW orders_silver_flow AS AUTO CDC
+into orders_silver
+from STREAM(orders_silver_cleaned)
+keys(order_id)
+sequence by load_time;
+
+-- COMMAND ----------
+
+CREATE MATERIALIZED VIEW city_wise_sales_gold
+as
+SELECT city, sum(total_amount) as total_sales
+from live.orders_silver o
+join live.customers_silver c
+on o.customer_id = c.customer_id
+group by city;
